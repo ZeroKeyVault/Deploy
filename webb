@@ -1,0 +1,118 @@
+const express = require('express');
+const http = require('http');
+const { ExpressPeerServer } = require('peer');
+const WebSocket = require('ws');
+const crypto = require('crypto');
+
+const app = express();
+const server = http.createServer(app);
+const port = process.env.PORT || 3000;
+
+// PeerJS server
+const peerServer = ExpressPeerServer(server, {
+  proxied: true,
+  debug: true,
+  path: '/peerjs',
+  ssl: {}
+});
+
+app.use('/peerjs', peerServer);
+
+// WebSocket server for message relay
+const wss = new WebSocket.Server({ server });
+
+// Store offline messages
+const messageStore = new Map();
+const publicVaults = new Map();
+const usedHashes = new Set();
+
+// Delete expired vaults every hour
+setInterval(() => {
+  const now = Date.now();
+  publicVaults.forEach((vault, hash) => {
+    if (vault.expiry <= now) {
+      messageStore.delete(hash);
+      publicVaults.delete(hash);
+    }
+  });
+}, 3600000);
+
+wss.on('connection', (ws) => {
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data);
+      
+      switch (msg.type) {
+        case 'create_public_vault':
+          const publicHash = crypto.randomBytes(32).toString('hex');
+          publicVaults.set(publicHash, {
+            name: msg.vaultName,
+            expiry: Date.now() + msg.expiryTime,
+            key: msg.encryptionKey
+          });
+          ws.send(JSON.stringify({ type: 'public_hash', hash: publicHash }));
+          break;
+
+        case 'join_public_vault':
+          if (publicVaults.has(msg.hash)) {
+            const vault = publicVaults.get(msg.hash);
+            ws.send(JSON.stringify({ 
+              type: 'vault_joined', 
+              name: vault.name,
+              expiry: vault.expiry,
+              key: vault.key
+            }));
+          } else {
+            ws.send(JSON.stringify({ type: 'error', message: 'Vault not found' }));
+          }
+          break;
+
+        case 'relay_message':
+          if (messageStore.has(msg.vaultID)) {
+            const messages = messageStore.get(msg.vaultID);
+            messages.push(msg.encryptedData);
+          } else {
+            messageStore.set(msg.vaultID, [msg.encryptedData]);
+          }
+          ws.send(JSON.stringify({ type: 'ack', message: 'Message stored for relay' }));
+          break;
+
+        case 'fetch_messages':
+          const messages = messageStore.get(msg.vaultID) || [];
+          ws.send(JSON.stringify({ type: 'vault_messages', messages }));
+          messageStore.delete(msg.vaultID); // Delete after relay
+          break;
+
+        case 'create_private_vault':
+          const privateHash = crypto.randomBytes(32).toString('hex');
+          usedHashes.add(privateHash);
+          ws.send(JSON.stringify({ 
+            type: 'private_hash', 
+            hash: privateHash,
+            expiry: Date.now() + msg.expiryTime
+          }));
+          break;
+
+        case 'join_private_vault':
+          if (usedHashes.has(msg.hash)) {
+            usedHashes.delete(msg.hash);
+            ws.send(JSON.stringify({ 
+              type: 'vault_joined', 
+              name: msg.vaultName,
+              key: msg.encryptionKey
+            }));
+          } else {
+            ws.send(JSON.stringify({ type: 'error', message: 'Invalid or expired vault hash' }));
+          }
+          break;
+      }
+    } catch (err) {
+      console.error('Error processing message:', err);
+      ws.send(JSON.stringify({ type: 'error', message: 'Invalid request' }));
+    }
+  });
+});
+
+server.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+});
